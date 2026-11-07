@@ -343,170 +343,33 @@ cat(sprintf("  Best init_sig = %.4f, init_pw_sig = %.4f  (train log-lik = %.4f)\
 # 8. WALK-FORWARD ENGINE & WRAPPERS
 # ==============================================================================
 
-# Core walk-forward engine for PGlicko.
-# Runs predict-then-update over `data` from the supplied rating state.
-# Returns predictions, metrics, and end state for chaining train → test.
-run_pglicko_phase <- function(data, cur_Ratings, cur_pw, cur_pw_sd,
-                              init_sig, init_pw_sig, rdmax = RDMAX, c_rd = CVAL_PGLICKO) {
-  
-  # ── Guarantee character dimnames on entry ──────────────────────────────────
-  rownames(cur_pw)    <- as.character(rownames(cur_pw))
-  colnames(cur_pw)    <- as.character(colnames(cur_pw))
-  rownames(cur_pw_sd) <- as.character(rownames(cur_pw_sd))
-  colnames(cur_pw_sd) <- as.character(colnames(cur_pw_sd))
-  names(cur_Ratings$Rating) <- as.character(names(cur_Ratings$Rating))
-  names(cur_Ratings$Sigma)  <- as.character(names(cur_Ratings$Sigma))
-  
-  n_rows   <- nrow(data)
-  preds    <- numeric(n_rows)
-  pred_cls <- integer(n_rows)
-  seasons  <- sort(unique(data$Season))
-  
-  for (season in seasons) {                         # renamed: season, not p
-    period_data <- data[data$Season == season, ]
-    period_rows <- which(data$Season == season)
-    
-    # Register any players not yet seen
-    all_pl <- as.character(unique(c(period_data$Player1, period_data$Player2)))
-    for (nm in all_pl) {
-      if (!(nm %in% names(cur_Ratings$Rating))) {
-        cur_Ratings$Rating[nm] <- INIT_RATING
-        cur_Ratings$Sigma[nm]  <- init_sig
-        cur_Ratings$Games[nm]  <- 0L
-        cur_Ratings$Win[nm]    <- 0L
-        cur_Ratings$Loss[nm]   <- 0L
-        cur_Ratings$Lag[nm]    <- 0L
-        cur_Ratings$debut[nm]  <- "No"
-        
-        n_old <- nrow(cur_pw)
-        # expand pairwise strength matrix
-        new_pw_row <- matrix(0, nrow = 1, ncol = n_old,
-                             dimnames = list(nm, rownames(cur_pw)))
-        new_pw_col <- matrix(0, nrow = n_old + 1, ncol = 1,
-                             dimnames = list(c(rownames(cur_pw), nm), nm))
-        cur_pw     <- cbind(rbind(cur_pw, new_pw_row), new_pw_col)
-        
-        # expand pairwise SD matrix
-        new_pws_row <- matrix(init_pw_sig, nrow = 1, ncol = n_old,
-                              dimnames = list(nm, rownames(cur_pw_sd)))
-        new_pws_col <- matrix(init_pw_sig, nrow = n_old + 1, ncol = 1,
-                              dimnames = list(c(rownames(cur_pw_sd), nm), nm))
-        cur_pw_sd   <- cbind(rbind(cur_pw_sd, new_pws_row), new_pws_col)
-        
-        # re-coerce after expansion to be safe
-        rownames(cur_pw)    <- as.character(rownames(cur_pw))
-        colnames(cur_pw)    <- as.character(colnames(cur_pw))
-        rownames(cur_pw_sd) <- as.character(rownames(cur_pw_sd))
-        colnames(cur_pw_sd) <- as.character(colnames(cur_pw_sd))
-      }
-    }
-    
-    # STEP 1: predict before update
-    for (g in seq_len(nrow(period_data))) {
-      p1 <- as.character(period_data$Player1[g])
-      p2 <- as.character(period_data$Player2[g])
-      
-      ps_val  <- cur_pw[p1, p2]
-      psd_val <- cur_pw_sd[p1, p2]
-      if (is.na(ps_val))  ps_val  <- 0
-      if (is.na(psd_val)) psd_val <- init_pw_sig
-      
-      wp <- winning_prob(mu_i  = cur_Ratings$Rating[p1],
-                         sig_i = cur_Ratings$Sigma[p1],
-                         mu_j  = cur_Ratings$Rating[p2],
-                         sig_j = cur_Ratings$Sigma[p2],
-                         pairwise_strength_ij = ps_val,
-                         pairwise_sd_ij       = psd_val)
-      preds[period_rows[g]]    <- wp
-      pred_cls[period_rows[g]] <- as.integer(wp >= 0.5)
-    }
-    
-    # STEP 2: update
-    players_p <- as.character(sort(unique(c(period_data$Player1,
-                                            period_data$Player2))))
-
-    # Glicko step 1: RD growth for every player who has already debuted
-    prev_debut <- cur_Ratings$debut == "Yes"
-    if (any(prev_debut)) {
-      cur_Ratings$Sigma[prev_debut] <- pmin(sqrt(cur_Ratings$Sigma[prev_debut]^2 + c_rd^2), rdmax)
-    }
-    cur_Ratings$debut[players_p] <- "Yes"
-
-    old_r   <- cur_Ratings;  new_r   <- cur_Ratings
-    old_pw  <- cur_pw;       new_pw  <- cur_pw
-    old_pws <- cur_pw_sd;    new_pws <- cur_pw_sd
-    
-    for (i in players_p) {
-      pl_games <- period_data[period_data$Player1 == i |
-                                period_data$Player2 == i, ]
-      delta_i  <- tryCatch(
-        delta_player_rating(season, i, pl_games, old_r, old_pw, old_pws),
-        error = function(e) NA_real_)
-      if (!is.na(delta_i)) {
-        new_s          <- min(rdmax, sigma_update(old_r$Sigma[i], delta_i))
-        new_r$Sigma[i] <- new_s
-        new_r$Rating[i]<- player_rating_update(season, i, pl_games,
-                                               old_r, old_pw, old_pws,
-                                               new_sigma = new_s)
-      }
-    }
-    
-    # Unordered pairs: each pair is updated once per period from all its games
-    pairs_mat <- unique(cbind(pmin(period_data$Player1, period_data$Player2),
-                              pmax(period_data$Player1, period_data$Player2)))
-    for (pi in seq_len(nrow(pairs_mat))) {
-      p1 <- as.character(pairs_mat[pi, 1])
-      p2 <- as.character(pairs_mat[pi, 2])
-      pair_g <- period_data[period_data$Player1 == p1 &
-                              period_data$Player2 == p2, ]
-      dpw <- tryCatch(
-        delta_pairwise_strength(season, p1, p2, pair_g, old_r, old_pw, old_pws),
-        error = function(e) NA_real_)
-      if (!is.na(dpw)) {
-        new_pws[p1, p2] <- min(rdmax, sigma_update(old_pws[p1, p2], dpw))
-        new_pw[p1, p2]  <- pairwise_strength_update(season, p1, p2, pair_g,
-                                                    old_r, old_pw, old_pws,
-                                                    new_sigma = new_pws[p1, p2])
-        new_pws[p2, p1] <- new_pws[p1, p2]
-        new_pw[p2, p1]  <- -new_pw[p1, p2]
-      }
-    }
-    
-    cur_Ratings$Rating[players_p] <- new_r$Rating[players_p]
-    cur_Ratings$Sigma[players_p]  <- new_r$Sigma[players_p]
-    cur_pw    <- new_pw
-    cur_pw_sd <- new_pws
-  }
-  
+# Walk-forward for PGlicko: predict each period's games from the ratings at the
+# start of the period, then update (pglicko_phase() in the PGlicko functions).
+# The state - ratings plus a compact table of pairwise strengths and deviations
+# for the pairs that have played - is returned for chaining train -> test.
+run_pglicko_phase <- function(data, cur_state, init_sig, init_pw_sig,
+                              rdmax = RDMAX, c_rd = CVAL_PGLICKO) {
+  out    <- pglicko_phase(c(init_sig, init_pw_sig), data, state = cur_state,
+                          rdmax = rdmax, c_rd = c_rd, init_rating = INIT_RATING)
+  preds  <- out$preds
   actual <- data$Game_Result
-  list(preds       = preds,
-       pred_class  = pred_cls,
-       actual      = actual,
-       auc         = calc_auc(actual, preds),
-       acc         = calc_acc(actual, preds),
-       ll          = log_loss(actual, preds),
-       end_Ratings = cur_Ratings,
-       end_pw      = cur_pw,
-       end_pw_sd   = cur_pw_sd)
+  list(preds      = preds,
+       pred_class = as.integer(preds >= 0.5),
+       actual     = actual,
+       auc        = calc_auc(actual, preds),
+       acc        = calc_acc(actual, preds),
+       ll         = log_loss(actual, preds),
+       end_state  = out$state)
 }
 
-# Wrapper: builds fresh initial state and walks forward over `data`.
-# Returns the phase result (including end state) for chaining to test.
+# Wrapper: fresh start (every player at INIT_RATING) and walk forward over `data`.
 run_pglicko <- function(data,
                         init_r      = INIT_RATING,
                         init_sig    = best_sig_pglicko,
                         init_pw_sig = best_pwsig_pglicko,
                         rdmax       = RDMAX,
                         c_rd        = CVAL_PGLICKO) {
-  fresh_Ratings <- Rating_Table_initialize(
-    sort(unique(c(data$Player1, data$Player2))), init_r, init_sig)
-  fresh_pw      <- Pairwise_Strength_initialize(
-    sort(unique(c(data$Player1, data$Player2))))
-  fresh_pw_sd   <- Pairwise_Strength_sd_initialize(
-    sort(unique(c(data$Player1, data$Player2))), init_pw_sig)
-  
-  run_pglicko_phase(data, fresh_Ratings, fresh_pw, fresh_pw_sd,
-                    init_sig, init_pw_sig, rdmax, c_rd)
+  run_pglicko_phase(data, NULL, init_sig, init_pw_sig, rdmax, c_rd)
 }
 
 
@@ -561,22 +424,13 @@ glicko_test_obj <- run_glicko_playerratings(best_sig_glicko, test_df,
                                             rdmax  = RDMAX)
 
 # ── 10d. PGlicko ─────────────────────────────────────────────────────────────
-# CRITICAL: rebuild cache over the full dataset so that the internal delta/update
-# functions can look up period-level sufficient statistics for test seasons.
-# The optimisation in Section 7 used train-only cache; test seasons were absent.
-build_cache(rbind(train_df, test_df))
-
+# Continues from the end-of-train state (ratings and pairwise table)
 pglicko_test_obj <- run_pglicko_phase(test_df,
-                                      pglicko_train_obj$end_Ratings,
-                                      pglicko_train_obj$end_pw,
-                                      pglicko_train_obj$end_pw_sd,
+                                      pglicko_train_obj$end_state,
                                       best_sig_pglicko,
                                       best_pwsig_pglicko,
                                       RDMAX,
                                       CVAL_PGLICKO)
-
-# Restore train-only cache so any downstream code that uses it remains correct
-build_cache(train_df)
 
 
 # ==============================================================================

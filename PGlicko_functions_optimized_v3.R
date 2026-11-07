@@ -26,23 +26,13 @@ build_cache <- function(dataset) {
   
   by_season <- split(dataset, dataset$Season)
   .cache$by_season <- by_season
-  
-  # Per season: split by player
-  .cache$by_season_player <- lapply(by_season, function(d) {
-    all_p <- unique(c(d$Player1, d$Player2))
-    setNames(
-      lapply(all_p, function(pl)
-        d[d$Player1 == pl | d$Player2 == pl, , drop = FALSE]),
-      all_p
-    )
-  })
-  
-  # Per season: split by UNORDERED pair key, so all n_j games between two
-  # players are pooled regardless of who is listed as Player1 (eqs 30, 32)
-  .cache$by_season_pair <- lapply(by_season, function(d) {
-    keys <- paste(pmin(d$Player1, d$Player2), pmax(d$Player1, d$Player2), sep = "_")
-    split(d, keys)
-  })
+
+  # The per-player and per-pair splits of every season are only needed by the
+  # per-player helper functions (delta_player_rating() etc.), not by get_like()
+  # or pglicko_phase(). They hold one small data frame per player and per pair
+  # per season, so they are built lazily, on first use (see .ensure_splits()).
+  .cache$by_season_player <- NULL
+  .cache$by_season_pair   <- NULL
 
   # Remember which dataset this cache was built from (checked in get_like)
   .cache$dataset <- dataset
@@ -54,12 +44,10 @@ build_cache <- function(dataset) {
   # so get_like never recomputes these across ~175 optim() calls
   .cache$p_x      <- periods(dataset)
   .cache$Players  <- players(dataset)
-  .cache$Pairwise_List_Vector <- Pairwise_initialize(.cache$Players)[[2]]
-  
-  # FIX 5: pre-build colname lookup set for winning_prob_vectorized
-  # avoids repeated %in% colnames(PS_ts) inside the row loop
-  .cache$ps_col_set <- NULL  # populated after first get_like builds PS_ts colnames
-  # (set lazily on first call since PS_ts colnames = Pairwise_List_Vector)
+  # Pairs that actually meet in the data ("p1_p2", p1 first in sort order).
+  # Listing every possible pair (combn) would need players^2 / 2 strings.
+  lo <- pmin(dataset$Player1, dataset$Player2); hi <- pmax(dataset$Player1, dataset$Player2)
+  .cache$Pairwise_List_Vector <- sort(unique(paste(lo, hi, sep = "_")))
   .cache$ps_col_idx <- setNames(
     seq_along(.cache$Pairwise_List_Vector),
     .cache$Pairwise_List_Vector
@@ -71,13 +59,36 @@ build_cache <- function(dataset) {
 # ============================================================
 # FAST LOOKUP REPLACEMENTS
 # ============================================================
+.ensure_splits <- function() {
+  if (is.null(.cache$by_season_player)) {
+    # Per season: split by player
+    .cache$by_season_player <- lapply(.cache$by_season, function(d) {
+      all_p <- unique(c(d$Player1, d$Player2))
+      setNames(
+        lapply(all_p, function(pl)
+          d[d$Player1 == pl | d$Player2 == pl, , drop = FALSE]),
+        all_p
+      )
+    })
+    # Per season: split by UNORDERED pair key, so all n_j games between two
+    # players are pooled regardless of who is listed as Player1 (eqs 30, 32)
+    .cache$by_season_pair <- lapply(.cache$by_season, function(d) {
+      keys <- paste(pmin(d$Player1, d$Player2), pmax(d$Player1, d$Player2), sep = "_")
+      split(d, keys)
+    })
+  }
+  invisible(NULL)
+}
+
 get_player_games <- function(p, name) {
+  .ensure_splits()
   sp <- .cache$by_season_player[[as.character(p)]]
   if (is.null(sp)) return(NULL)
   sp[[name]]
 }
 
 get_pair_games <- function(p, name1, name2) {
+  .ensure_splits()
   key <- paste(pmin(name1, name2), pmax(name1, name2), sep = "_")
   .cache$by_season_pair[[as.character(p)]][[key]]
 }
@@ -280,24 +291,57 @@ prediction <- function(x) as.integer(x >= 0.5)
 # ============================================================
 # VECTORISED ENGINE
 # Runs P-Glicko over every period of `dataset`. Within a period all games are
-# processed at once with integer player indices and plain matrices:
+# processed at once with integer player indices and plain vectors:
 #   step 1  RD growth for debuted players: sigma <- min(sqrt(sigma^2 + c^2), rdmax)
 #   player updates   eqs (16)-(21), simultaneous, using pre-period values
 #   pairwise updates eqs (28)-(32), all games of an unordered pair pooled,
 #                    beta_ji = -beta_ij, b_ji = b_ij
-# Predictions (eq 34) use the mean rating over the previous 6 periods and the
-# RD / pairwise values at the end of the previous period.
+#
+# Pairwise strengths and their deviations are stored once per pair of players
+# that can meet (a compact pair table), not as players x players matrices, so
+# memory grows with the number of pairs that play, not with players^2.
+#
+# predict = "avg6":    eq (34) with the mean rating over the previous 6 periods
+#                      and the RD / pairwise values at the end of the previous
+#                      period (used by get_like); the first 6 periods get 0.5.
+# predict = "current": eq (34) with each player's rating and RD at the start of
+#                      the period (used by pglicko_phase).
+#
+# state (optional) continues from an earlier run: list(Ratings, pairs) as
+# returned in $state. New players start at init_rating / para[1]; new pairs at
+# strength 0 and deviation para[2].
 # ============================================================
-.pglicko_engine <- function(para, dataset, rdmax = 350, c_rd = 63.2) {
+.pglicko_engine <- function(para, dataset, rdmax = 350, c_rd = 63.2, state = NULL,
+                            predict = c("avg6", "current"), init_rating = 1500) {
 
+  predict <- match.arg(predict)
   init_sigm    <- para[1]
   init_pw_sigm <- para[2]
 
-  p_x     <- periods(dataset)
-  Players <- players(dataset)
-  np      <- length(Players)
-  TT      <- length(p_x)
+  p_x <- periods(dataset)
+  TT  <- length(p_x)
   period_labels <- paste0("p", p_x)
+
+  # Players: sorted when starting fresh; otherwise the state's players followed
+  # by new players in order of first appearance (period by period)
+  if (is.null(state)) {
+    Players <- players(dataset)
+    np <- length(Players)
+    mu <- rep(init_rating, np); sg <- rep(init_sigm, np); debut <- logical(np)
+    games <- win <- loss <- lag <- integer(np)
+  } else {
+    R0 <- state$Ratings
+    first_seen <- unique(unlist(lapply(split(dataset, factor(dataset$Season, levels = p_x)),
+                                       function(d) unique(c(d$Player1, d$Player2)))))
+    new_pl  <- setdiff(first_seen, R0$Players)
+    Players <- c(R0$Players, new_pl)
+    np <- length(Players); nn <- length(new_pl)
+    mu <- c(unname(R0$Rating[R0$Players]), rep(init_rating, nn))
+    sg <- c(unname(R0$Sigma[R0$Players]),  rep(init_sigm, nn))
+    debut <- c(unname(R0$debut[R0$Players]) == "Yes", rep(FALSE, nn))
+    games <- c(unname(R0$Games[R0$Players]), integer(nn)); win <- c(unname(R0$Win[R0$Players]), integer(nn))
+    loss  <- c(unname(R0$Loss[R0$Players]),  integer(nn)); lag <- c(unname(R0$Lag[R0$Players]), integer(nn))
+  }
 
   a_all <- match(dataset$Player1, Players)
   b_all <- match(dataset$Player2, Players)
@@ -305,27 +349,41 @@ prediction <- function(x) as.integer(x >= 0.5)
   t_all <- match(dataset$Season, p_x)
   rows  <- split(seq_along(t_all), factor(t_all, levels = seq_len(TT)))
 
-  mu    <- rep(1500, np)
-  sg    <- rep(init_sigm, np)
-  debut <- logical(np)
-  games <- win <- loss <- lag <- integer(np)
-  B     <- matrix(0, np, np)              # pairwise advantage beta[i, j]
-  Bs    <- matrix(init_pw_sigm, np, np)   # pairwise deviation b[i, j]
+  # ---- pair table: one strength (beta, from the lower-index player's side) and
+  #      one deviation per unordered pair; pairs from `state` are carried over
+  lo_all <- pmin(a_all, b_all); hi_all <- pmax(a_all, b_all)
+  key_all <- lo_all * (np + 1) + hi_all
+  pkey <- unique(key_all)
+  beta <- numeric(length(pkey)); bsd <- rep(init_pw_sigm, length(pkey))
+  if (!is.null(state) && nrow(state$pairs) > 0) {
+    i1 <- match(state$pairs$Player1, Players); i2 <- match(state$pairs$Player2, Players)
+    sk <- pmin(i1, i2) * (np + 1) + pmax(i1, i2)
+    sv <- ifelse(i1 <= i2, state$pairs$PairAdv, -state$pairs$PairAdv)
+    extra <- !(sk %in% pkey)
+    pkey <- c(pkey, sk[extra]); beta <- c(beta, numeric(sum(extra))); bsd <- c(bsd, numeric(sum(extra)))
+    m <- match(sk, pkey); beta[m] <- sv; bsd[m] <- state$pairs$PairSD
+  }
+  pid_all <- match(key_all, pkey)
+  sgn_all <- ifelse(a_all < b_all, 1, ifelse(a_all > b_all, -1, 0))
 
-  ratings_ts <- matrix(1500,      TT, np, dimnames = list(period_labels, Players))
-  sigma_ts   <- matrix(init_sigm, TT, np, dimnames = list(period_labels, Players))
-  attendance <- matrix(NA_character_, TT, np, dimnames = list(period_labels, Players))
+  keep_ts <- predict == "avg6"
+  if (keep_ts) {
+    ratings_ts <- matrix(init_rating, TT, np, dimnames = list(period_labels, Players))
+    sigma_ts   <- matrix(init_sigm,   TT, np, dimnames = list(period_labels, Players))
+  }
 
-  # Per-game values at the end of the previous period (for prediction)
+  # Per-game values at the start of the period (for prediction)
   g_beta <- g_b <- numeric(length(s_all))
+  if (!keep_ts) g_mua <- g_mub <- g_sga <- g_sgb <- numeric(length(s_all))
   q <- .Q; K <- .K
 
   for (t in seq_len(TT)) {
     r  <- rows[[t]]
     a  <- a_all[r];  b <- b_all[r];  s <- s_all[r]
-    ab <- cbind(a, b)
-    bet <- B[ab];  bsd <- Bs[ab]
-    g_beta[r] <- bet;  g_b[r] <- bsd
+    k  <- pid_all[r]
+    bet <- sgn_all[r] * beta[k];  bsdv <- bsd[k]
+    g_beta[r] <- bet;  g_b[r] <- bsdv
+    if (!keep_ts) { g_mua[r] <- mu[a]; g_mub[r] <- mu[b]; g_sga[r] <- sg[a]; g_sgb[r] <- sg[b] }
 
     # Step 1: RD growth for players who have already debuted
     sg[debut] <- pmin(sqrt(sg[debut]^2 + c_rd^2), rdmax)
@@ -341,13 +399,11 @@ prediction <- function(x) as.integer(x >= 0.5)
     idle  <- setdiff(which(debut), act)
     lag[idle] <- lag[idle] + 1L
     lag[act]  <- 0L
-    attendance[t, idle] <- "No"
-    attendance[t, act]  <- "Yes"
 
     # Player updates, eqs (16)-(21): Player1's side and Player2's side of every game
-    G1 <- 1 / sqrt(1 + K * (sg0[b]^2 + bsd^2))
+    G1 <- 1 / sqrt(1 + K * (sg0[b]^2 + bsdv^2))
     E1 <- 1 / (1 + 10^(-G1 * (mu0[a] + bet - mu0[b]) / 400))
-    G2 <- 1 / sqrt(1 + K * (sg0[a]^2 + bsd^2))
+    G2 <- 1 / sqrt(1 + K * (sg0[a]^2 + bsdv^2))
     E2 <- 1 / (1 + 10^(-G2 * (mu0[b] - bet - mu0[a]) / 400))
     v  <- rowsum(cbind(c(G1^2 * E1 * (1 - E1), G2^2 * E2 * (1 - E2)),   # 1/(q^2 delta^2)
                        c(G1 * (s - E1),        G2 * (1 - s - E2))),      # score residuals
@@ -362,42 +418,66 @@ prediction <- function(x) as.integer(x >= 0.5)
     uk  <- sort(unique(key))
     w   <- rowsum(cbind(1, s_lo), match(key, uk))         # n_j and sum of scores per pair
     pl  <- uk %/% (np + 1);  ph <- uk %% (np + 1)
-    lh  <- cbind(pl, ph);    hl <- cbind(ph, pl)
+    kk  <- match(uk, pkey)
     G   <- 1 / sqrt(1 + K * (sg0[pl]^2 + sg0[ph]^2))
-    E   <- 1 / (1 + 10^(-G * (mu0[pl] + B[lh] - mu0[ph]) / 400))
-    b_new    <- pmin(rdmax, sqrt(1 / (1 / Bs[lh]^2 + q^2 * w[, 1] * G^2 * E * (1 - E))))
-    beta_new <- B[lh] + q * b_new^2 * G * (w[, 2] - w[, 1] * E)
-    B[lh]  <- beta_new;  B[hl]  <- -beta_new
-    Bs[lh] <- b_new;     Bs[hl] <- b_new
+    E   <- 1 / (1 + 10^(-G * (mu0[pl] + beta[kk] - mu0[ph]) / 400))
+    b_new    <- pmin(rdmax, sqrt(1 / (1 / bsd[kk]^2 + q^2 * w[, 1] * G^2 * E * (1 - E))))
+    beta[kk] <- beta[kk] + q * b_new^2 * G * (w[, 2] - w[, 1] * E)
+    bsd[kk]  <- b_new
 
-    ratings_ts[t, ] <- mu
-    sigma_ts[t, ]   <- sg
+    if (keep_ts) { ratings_ts[t, ] <- mu; sigma_ts[t, ] <- sg }
   }
 
   # Predictions, eq (34)
-  wp <- rep(0.5, length(s_all))
-  ok <- which(t_all >= 7)
-  if (length(ok) > 0) {
-    tt <- t_all[ok];  i1 <- a_all[ok];  i2 <- b_all[ok]
-    cs <- rbind(0, apply(ratings_ts, 2, cumsum))
-    mu_i <- (cs[cbind(tt, i1)] - cs[cbind(tt - 6, i1)]) / 6
-    mu_j <- (cs[cbind(tt, i2)] - cs[cbind(tt - 6, i2)]) / 6
-    wp[ok] <- winning_prob(mu_i, sigma_ts[cbind(tt - 1, i1)], mu_j, sigma_ts[cbind(tt - 1, i2)],
-                           g_beta[ok], g_b[ok])
+  if (keep_ts) {
+    wp <- rep(0.5, length(s_all))
+    ok <- which(t_all >= 7)
+    if (length(ok) > 0) {
+      tt <- t_all[ok];  i1 <- a_all[ok];  i2 <- b_all[ok]
+      cs <- rbind(0, apply(ratings_ts, 2, cumsum))
+      mu_i <- (cs[cbind(tt, i1)] - cs[cbind(tt - 6, i1)]) / 6
+      mu_j <- (cs[cbind(tt, i2)] - cs[cbind(tt - 6, i2)]) / 6
+      wp[ok] <- winning_prob(mu_i, sigma_ts[cbind(tt - 1, i1)], mu_j, sigma_ts[cbind(tt - 1, i2)],
+                             g_beta[ok], g_b[ok])
+    }
+  } else {
+    wp <- winning_prob(g_mua, g_sga, g_mub, g_sgb, g_beta, g_b)
   }
 
-  diag(B) <- NA;  diag(Bs) <- NA
-  dimnames(B) <- dimnames(Bs) <- list(Players, Players)
   nm <- function(x) setNames(x, Players)
-  list(Ratings = list(Rating = nm(mu), Sigma = nm(sg), Games = nm(games), Win = nm(win),
-                      Loss = nm(loss), Lag = nm(lag), debut = nm(ifelse(debut, "Yes", "No")),
-                      Players = Players),
-       Pairwise_Strength_Matrix    = B,
-       Pairwise_Strength_sd_Matrix = Bs,
-       ratings_ts = ratings_ts,
-       sigma_ts   = sigma_ts,
-       attendance = attendance,
-       wp         = wp)
+  pk_lo <- pkey %/% (np + 1); pk_hi <- pkey %% (np + 1)
+  st <- list(
+    Ratings = list(Rating = nm(mu), Sigma = nm(sg), Games = nm(games), Win = nm(win),
+                   Loss = nm(loss), Lag = nm(lag), debut = nm(ifelse(debut, "Yes", "No")),
+                   Players = Players),
+    pairs = data.frame(Player1 = Players[pk_lo], Player2 = Players[pk_hi],
+                       PairAdv = beta, PairSD = bsd, stringsAsFactors = FALSE))
+  out <- list(state = st, wp = wp)
+  if (keep_ts) { out$ratings_ts <- ratings_ts; out$sigma_ts <- sigma_ts }
+  out
+}
+
+# ============================================================
+# WALK-FORWARD PHASE (predict, then update), memory-efficient
+# ============================================================
+# Runs P-Glicko over `data` period by period: each period's games are first
+# predicted from the ratings, RDs and pairwise values at the start of the
+# period (eq 34), then all of the period's updates are applied together.
+#
+#   para   c(initial sigma, initial pairwise sigma)
+#   data   data frame with Season, Player1, Player2, Game_Result
+#   state  NULL to start fresh (all players at init_rating), or the $state of
+#          an earlier call, to continue (e.g. from training into testing).
+#          New players and pairs are added automatically.
+#
+# Returns list(preds, state). state$pairs is a compact pair table with columns
+# Player1, Player2, PairAdv (Player1's pairwise strength over Player2) and
+# PairSD, one row per pair that has played; state$Ratings is a rating list as
+# from Rating_Table_initialize().
+pglicko_phase <- function(para, data, state = NULL, rdmax = 350, c_rd = 63.2, init_rating = 1500) {
+  e <- .pglicko_engine(para, data, rdmax = rdmax, c_rd = c_rd, state = state,
+                       predict = "current", init_rating = init_rating)
+  list(preds = e$wp, state = e$state)
 }
 
 # ============================================================
